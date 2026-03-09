@@ -4,7 +4,6 @@ import csv
 import itertools
 import json
 import math
-import re
 from contextlib import redirect_stdout
 from io import StringIO
 
@@ -13,11 +12,6 @@ import numpy as np
 
 def _cell_code(cells, idx):
     return "".join(cells[idx]["source"])
-
-
-def _load_notebook(notebook_path):
-    with open(notebook_path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def _strip_lines(code, startswith_prefixes=(), contains_tokens=()):
@@ -32,65 +26,10 @@ def _strip_lines(code, startswith_prefixes=(), contains_tokens=()):
     return "\n".join(out) + "\n"
 
 
-def extract_ranges_from_notebook(nb):
-    # Supports two formats in notebook text:
-    # 1) d1_отн может быть от 0.3 до 0.6
-    # 2) d1_отн_start = 0.3 / d1_отн_end = 0.6
-    pattern_human = re.compile(
-        r"^\s*([^\s]+)\s+может\s+быть\s+от\s+([0-9]+(?:[.,][0-9]+)?)\s+до\s+([0-9]+(?:[.,][0-9]+)?)\s*$",
-        re.IGNORECASE,
-    )
-    pattern_bounds = re.compile(
-        r"^\s*([^\s=]+)_(start|end)\s*=\s*([0-9]+(?:[.,][0-9]+)?)\s*$",
-        re.IGNORECASE,
-    )
-
-    ranges = {}
-    bounds = {}
-    for cell in nb["cells"]:
-        text = "".join(cell.get("source", []))
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            m_human = pattern_human.match(line)
-            if m_human:
-                var_name = m_human.group(1)
-                vmin = float(m_human.group(2).replace(",", "."))
-                vmax = float(m_human.group(3).replace(",", "."))
-                ranges[var_name] = (vmin, vmax)
-                continue
-
-            m_bounds = pattern_bounds.match(line)
-            if m_bounds:
-                var_name = m_bounds.group(1)
-                bound_type = m_bounds.group(2).lower()
-                value = float(m_bounds.group(3).replace(",", "."))
-                if var_name not in bounds:
-                    bounds[var_name] = {}
-                bounds[var_name][bound_type] = value
-
-    for var_name, dct in bounds.items():
-        if "start" in dct and "end" in dct:
-            ranges[var_name] = (dct["start"], dct["end"])
-
-    return ranges
-
-
-def infer_targets_from_notebook(nb):
-    # Use code cells that define pi target (section 1) and eta formula.
-    cells = nb["cells"]
-    ns = {"math": math, "np": np}
-    capture = StringIO()
-    with redirect_stdout(capture):
-        exec(_cell_code(cells, 4), ns)
-        exec(_cell_code(cells, 11), ns)
-    return {
-        "π_к_полн": float(ns["π_к_полн"]),
-        "η_к_полн": float(ns["η_к_полн"]),
-    }
-
-
 def build_runner(notebook_path):
-    nb = _load_notebook(notebook_path)
+    with open(notebook_path, "r", encoding="utf-8") as f:
+        nb = json.load(f)
+
     cells = nb["cells"]
 
     code_graph = _strip_lines(
@@ -98,7 +37,6 @@ def build_runner(notebook_path):
         contains_tokens=("plt.", "plot_results(", "display("),
     )
     code_consts = _cell_code(cells, 4)
-    code_params = _cell_code(cells, 7)
     code_n_convert = _strip_lines(_cell_code(cells, 9), startswith_prefixes=("print(",))
 
     code_fn = _cell_code(cells, 10)
@@ -125,7 +63,6 @@ def build_runner(notebook_path):
         capture = StringIO()
         with redirect_stdout(capture):
             exec(runner_code, ns)
-            exec(code_params, ns)
 
             # Override initial parameters from section 2
             ns["d1_отн"] = params["d1_отн"]
@@ -133,6 +70,7 @@ def build_runner(notebook_path):
             ns["с_а_отн"] = params["с_а_отн"]
             ns["Hт_ср_отн"] = params["Hт_ср_отн"]
             ns["H_т1"] = params["H_т1"]
+            ns["R_ср1"] = 0.5
 
             # Re-run section 2 + 3 with trial parameters
             exec(code_n_convert, ns)
@@ -182,7 +120,7 @@ def score(metrics, targets):
     return total, details
 
 
-def build_targets(args, nb):
+def build_targets(args):
     # Compare only by compressor targets (as requested).
     if args.target_pi_k is not None and args.target_eta_k is not None:
         return {
@@ -190,7 +128,15 @@ def build_targets(args, nb):
             "η_к_полн": args.target_eta_k,
         }
 
-    return infer_targets_from_notebook(nb)
+    # Safe defaults from technical assignment + section 1 formula
+    k = 1.4
+    pi_k = 18.2
+    eta_pol = 0.92
+    eta_k = (pi_k ** ((k - 1) / k) - 1) / (pi_k ** ((k - 1) / (k * eta_pol)) - 1)
+    return {
+        "π_к_полн": pi_k,
+        "η_к_полн": eta_k,
+    }
 
 
 def main():
@@ -211,26 +157,15 @@ def main():
     parser.add_argument("--export-file", default="подбор_комбинаций.csv")
     args = parser.parse_args()
 
-    nb = _load_notebook(args.notebook)
     run_trial = build_runner(args.notebook)
 
-    parsed_ranges = extract_ranges_from_notebook(nb)
-    required = ["d1_отн", "c_а1_отн", "с_а_отн", "Hт_ср_отн", "H_т1"]
-    missing = [name for name in required if name not in parsed_ranges]
-    if missing:
-        raise ValueError(
-            "В notebook не найдены диапазоны для: "
-            + ", ".join(missing)
-            + ". Добавьте строки вида: '<параметр> может быть от <min> до <max>'."
-        )
-
-    # Ranges from notebook markdown + step from CLI
+    # Ranges from section 2 of notebook
     ranges = {
-        "d1_отн": frange(parsed_ranges["d1_отн"][0], parsed_ranges["d1_отн"][1], args.step_d1),
-        "c_а1_отн": frange(parsed_ranges["c_а1_отн"][0], parsed_ranges["c_а1_отн"][1], args.step_ca1),
-        "с_а_отн": frange(parsed_ranges["с_а_отн"][0], parsed_ranges["с_а_отн"][1], args.step_ca_last),
-        "Hт_ср_отн": frange(parsed_ranges["Hт_ср_отн"][0], parsed_ranges["Hт_ср_отн"][1], args.step_Hsr),
-        "H_т1": frange(parsed_ranges["H_т1"][0], parsed_ranges["H_т1"][1], args.step_H1),
+        "d1_отн": frange(0.3, 0.6, args.step_d1),
+        "c_а1_отн": frange(0.4, 0.7, args.step_ca1),
+        "с_а_отн": frange(0.25, 0.6, args.step_ca_last),
+        "Hт_ср_отн": frange(0.1, 0.4, args.step_Hsr),
+        "H_т1": frange(0.15, 0.25, args.step_H1),
     }
 
     all_combinations = list(itertools.product(
@@ -241,7 +176,7 @@ def main():
         ranges["H_т1"],
     ))
 
-    targets = build_targets(args, nb)
+    targets = build_targets(args)
 
     print("Целевые параметры для сравнения:")
     for k, v in targets.items():
